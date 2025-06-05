@@ -1,379 +1,411 @@
 #include <iostream>
-#include <cstdlib>
-#include <memory>
-#include <string>
-#include <thread>
-#include <chrono>
-#include <atomic>
 #include <fstream>
 #include <sstream>
+#include <string>
 #include <map>
+#include <thread>
 #include <mutex>
-
-// MQTT
-#include <mqtt/async_client.h>
-
-// HTTP
-#include <curl/curl.h>
-
-// YAML parsing
+#include <chrono>
+#include <csignal>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
 #include <yaml-cpp/yaml.h>
-
-// K8s API
 #include <nlohmann/json.hpp>
 #include <curl/curl.h>
+#include "mqtt/async_client.h"
+
+// ----------------------
+// Helper Macros/Consts
+// ----------------------
+
+#define DEFAULT_MQTT_QOS 1
+#define CONFIG_PATH "/etc/edgedevice/config/instructions"
+#define DEVICE_STATUS_UPDATE_INTERVAL 5        // seconds
+#define DEVICE_TELEMETRY_POLL_INTERVAL 1       // seconds
 
 using json = nlohmann::json;
 
-// --------- ENV VAR UTILS ----------
-std::string getenv_or_throw(const std::string& var) {
-    const char* val = std::getenv(var.c_str());
+// ----------------------
+// Global Variables
+// ----------------------
+
+std::atomic<bool> running{true};
+std::mutex device_status_mutex;
+std::string device_phase = "Unknown";    // Pending, Running, Failed, Unknown
+
+// ----------------------
+// Utility Functions
+// ----------------------
+
+std::string getenvOrFail(const char* var) {
+    const char* val = std::getenv(var);
     if (!val) {
-        throw std::runtime_error("Environment variable " + var + " is not set");
+        std::cerr << "Missing required environment variable: " << var << std::endl;
+        exit(1);
     }
     return std::string(val);
 }
 
-std::string getenv_or_default(const std::string& var, const std::string& def) {
-    const char* val = std::getenv(var.c_str());
-    return val ? std::string(val) : def;
+size_t curl_write_cb(void* contents, size_t size, size_t nmemb, void* userp) {
+    std::string* s = (std::string*)userp;
+    s->append((char*)contents, size * nmemb);
+    return size * nmemb;
 }
 
-// --------- YAML CONFIG ------------
-struct ApiSettings {
+std::string http_request(const std::string& url, const std::string& method, const std::string& data = "", const std::map<std::string, std::string>& headers = {}) {
+    CURL* curl = curl_easy_init();
+    if (!curl) return "";
+
+    struct curl_slist* chunk = NULL;
+    for (const auto& h : headers) {
+        std::string header = h.first + ": " + h.second;
+        chunk = curl_slist_append(chunk, header.c_str());
+    }
+
+    std::string response;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    if (!headers.empty())
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, chunk);
+
+    if (method == "POST") {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+    }
+    else if (method == "GET") {
+        // default
+    }
+    else if (method == "PUT") {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+    }
+    else if (method == "PATCH") {
+        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
+    }
+
+    CURLcode res = curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    if (chunk) curl_slist_free_all(chunk);
+    if (res != CURLE_OK) {
+        return "";
+    }
+    return response;
+}
+
+// ------------------------------------
+// Kubernetes CRD Status Update Section
+// ------------------------------------
+
+void update_edgedevice_status(const std::string& name, const std::string& ns, const std::string& phase) {
+    // Use in-cluster service account token
+    std::ifstream tokenf("/var/run/secrets/kubernetes.io/serviceaccount/token");
+    std::string token((std::istreambuf_iterator<char>(tokenf)), std::istreambuf_iterator<char>());
+    tokenf.close();
+
+    std::ifstream caf("/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
+    bool use_ca = caf.good();
+    caf.close();
+
+    std::string k8s_host = "https://kubernetes.default.svc";
+    std::string url = k8s_host + "/apis/shifu.edgenesis.io/v1alpha1/namespaces/" + ns + "/edgedevices/" + name + "/status";
+
+    json status_patch = {
+        {"status", {{"edgeDevicePhase", phase}}}
+    };
+
+    std::map<std::string, std::string> headers = {
+        {"Authorization", "Bearer " + token},
+        {"Content-Type", "application/merge-patch+json"}
+    };
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return;
+    struct curl_slist* chunk = NULL;
+    for (const auto& h : headers) {
+        std::string header = h.first + ": " + h.second;
+        chunk = curl_slist_append(chunk, header.c_str());
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, status_patch.dump().c_str());
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, chunk);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 3L);
+    if (use_ca) {
+        curl_easy_setopt(curl, CURLOPT_CAINFO, "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt");
+    } else {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+    }
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    std::string dummy;
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &dummy);
+    curl_easy_perform(curl);
+    curl_easy_cleanup(curl);
+    if (chunk) curl_slist_free_all(chunk);
+}
+
+void device_status_updater(const std::string& name, const std::string& ns) {
+    std::string prev_phase = "";
+    while (running) {
+        device_status_mutex.lock();
+        std::string phase = device_phase;
+        device_status_mutex.unlock();
+
+        if (phase != prev_phase) {
+            update_edgedevice_status(name, ns, phase);
+            prev_phase = phase;
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(DEVICE_STATUS_UPDATE_INTERVAL));
+    }
+}
+
+// -----------------------------
+// ConfigMap Loader
+// -----------------------------
+
+struct APIInstructionConfig {
     std::map<std::string, std::string> protocolPropertyList;
 };
+using InstructionConfigMap = std::map<std::string, APIInstructionConfig>;
 
-class InstructionConfig {
-public:
-    std::map<std::string, ApiSettings> apis;
-
-    static InstructionConfig Load(const std::string& config_path) {
-        InstructionConfig config;
-        YAML::Node node = YAML::LoadFile(config_path);
-        for (const auto& it : node) {
-            ApiSettings api;
-            if (it.second["protocolPropertyList"]) {
-                for (const auto& p : it.second["protocolPropertyList"]) {
-                    api.protocolPropertyList[p.first.as<std::string>()] = p.second.as<std::string>();
+InstructionConfigMap load_instruction_config(const std::string& path) {
+    InstructionConfigMap result;
+    try {
+        YAML::Node root = YAML::LoadFile(path);
+        for (auto it = root.begin(); it != root.end(); ++it) {
+            std::string api = it->first.as<std::string>();
+            APIInstructionConfig config;
+            if (it->second["protocolPropertyList"]) {
+                auto ppl = it->second["protocolPropertyList"];
+                for (auto pit = ppl.begin(); pit != ppl.end(); ++pit) {
+                    config.protocolPropertyList[pit->first.as<std::string>()] = pit->second.as<std::string>();
                 }
             }
-            config.apis[it.first.as<std::string>()] = api;
+            result[api] = config;
         }
-        return config;
-    }
-};
+    } catch (...) {}
+    return result;
+}
 
-// --------- K8S CLIENT -------------
-class K8sClient {
-    std::string token;
-    std::string api_server;
+// -----------------------------
+// MQTT <-> HTTP Protocol Bridge
+// -----------------------------
+
+class MqttDeviceBridge : public virtual mqtt::callback, public virtual mqtt::iaction_listener {
 public:
-    K8sClient() {
-        std::ifstream tokenFile("/var/run/secrets/kubernetes.io/serviceaccount/token");
-        token = std::string((std::istreambuf_iterator<char>(tokenFile)), std::istreambuf_iterator<char>());
-        api_server = "https://" + getenv_or_default("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc") 
-                        + ":" + getenv_or_default("KUBERNETES_SERVICE_PORT", "443");
-    }
+    MqttDeviceBridge(
+        const std::string& broker,
+        const std::string& client_id,
+        const std::string& user_cmd_topic,
+        const std::string& device_telemetry_topic,
+        const std::string& device_cmd_topic,
+        const std::string& device_http_endpoint,
+        InstructionConfigMap& instruction_config,
+        int qos = DEFAULT_MQTT_QOS
+    ) :
+        cli_(broker, client_id),
+        user_cmd_topic_(user_cmd_topic),
+        device_telemetry_topic_(device_telemetry_topic),
+        device_cmd_topic_(device_cmd_topic),
+        device_http_endpoint_(device_http_endpoint),
+        qos_(qos),
+        instruction_config_(instruction_config)
+    {}
 
-    bool patch_status(const std::string& ns, const std::string& name, const std::string& phase) {
-        std::string url = api_server + "/apis/shifu.edgenesis.io/v1alpha1/namespaces/" + ns + "/edgedevices/" + name + "/status";
-        json patch_json;
-        patch_json["status"]["edgeDevicePhase"] = phase;
+    void connect() {
+        mqtt::connect_options connOpts;
+        connOpts.set_clean_session(true);
+        cli_.set_callback(*this);
 
-        CURL* curl = curl_easy_init();
-        struct curl_slist* headers = nullptr;
-        headers = curl_slist_append(headers, "Content-Type: application/merge-patch+json");
-        std::string auth_header = "Authorization: Bearer " + token;
-        headers = curl_slist_append(headers, auth_header.c_str());
-
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, patch_json.dump().c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, patch_json.dump().size());
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-
-        long http_code = 0;
-        CURLcode res = curl_easy_perform(curl);
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-        curl_easy_cleanup(curl);
-        curl_slist_free_all(headers);
-
-        return (res == CURLE_OK && (http_code == 200 || http_code == 201));
-    }
-
-    // Fetch EdgeDevice CR (for .spec.address)
-    std::string get_device_address(const std::string& ns, const std::string& name) {
-        std::string url = api_server + "/apis/shifu.edgenesis.io/v1alpha1/namespaces/" + ns + "/edgedevices/" + name;
-        CURL* curl = curl_easy_init();
-        struct curl_slist* headers = nullptr;
-        std::string auth_header = "Authorization: Bearer " + token;
-        headers = curl_slist_append(headers, auth_header.c_str());
-
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-
-        std::string response;
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](char* ptr, size_t size, size_t nmemb, void* userdata) {
-            std::string* s = static_cast<std::string*>(userdata);
-            s->append(ptr, size*nmemb);
-            return size*nmemb;
-        });
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-        CURLcode res = curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
-        curl_slist_free_all(headers);
-
-        if (res != CURLE_OK) return "";
-
-        auto j = json::parse(response, nullptr, false);
-        if (j.is_discarded() || !j.contains("spec") || !j["spec"].contains("address")) return "";
-        return j["spec"]["address"];
-    }
-};
-
-// --------- HTTP CLIENT ------------
-class HttpClient {
-public:
-    HttpClient() { curl_global_init(CURL_GLOBAL_ALL); }
-    ~HttpClient() { curl_global_cleanup(); }
-
-    bool post(const std::string& url, const std::string& data, std::string& result) {
-        CURL* curl = curl_easy_init();
-        struct curl_slist* headers = nullptr;
-        headers = curl_slist_append(headers, "Content-Type: application/json");
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-
-        // No verify for self-signed
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](char* ptr, size_t size, size_t nmemb, void* userdata) {
-            std::string* s = static_cast<std::string*>(userdata);
-            s->append(ptr, size*nmemb);
-            return size*nmemb;
-        });
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result);
-
-        CURLcode res = curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
-        curl_slist_free_all(headers);
-        return (res == CURLE_OK);
-    }
-
-    bool get(const std::string& url, std::string& result) {
-        CURL* curl = curl_easy_init();
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
-
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, +[](char* ptr, size_t size, size_t nmemb, void* userdata) {
-            std::string* s = static_cast<std::string*>(userdata);
-            s->append(ptr, size*nmemb);
-            return size*nmemb;
-        });
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &result);
-
-        CURLcode res = curl_easy_perform(curl);
-        curl_easy_cleanup(curl);
-        return (res == CURLE_OK);
-    }
-};
-
-// --------- MQTT CLIENT ------------
-class MqttBridge {
-    std::string broker_address;
-    std::string client_id;
-    std::string user_topic_telemetry;
-    std::string user_topic_commands;
-    std::string device_http_endpoint;
-    std::string telemetry_http_url;
-    std::string command_http_url;
-
-    std::string username, password;
-    int qos;
-    mqtt::async_client client;
-    mqtt::connect_options connOpts;
-    InstructionConfig config;
-
-    std::atomic<bool> connected;
-    std::atomic<bool> device_online;
-    std::atomic<bool> stop_telemetry;
-    std::mutex status_mutex;
-
-    K8sClient k8s;
-    HttpClient http;
-
-    std::string edgeDeviceName, edgeDeviceNamespace;
-    std::thread telemetry_thread;
-
-public:
-    MqttBridge(const std::string& broker, const std::string& clientId,
-        const std::string& telem_topic, const std::string& cmd_topic,
-        const std::string& device_http, int qos_,
-        const InstructionConfig& cfg,
-        const std::string& edgeName, const std::string& edgeNs)
-        : broker_address(broker),
-          client_id(clientId),
-          user_topic_telemetry(telem_topic), user_topic_commands(cmd_topic),
-          device_http_endpoint(device_http),
-          connOpts(),
-          config(cfg),
-          connected(false), device_online(false), stop_telemetry(false),
-          edgeDeviceName(edgeName), edgeDeviceNamespace(edgeNs),
-          client(broker, clientId), qos(qos_), http()
-    {
-        username = getenv_or_default("MQTT_USERNAME", "");
-        password = getenv_or_default("MQTT_PASSWORD", "");
-        if (!username.empty())
-            connOpts.set_user_name(username);
-        if (!password.empty())
-            connOpts.set_password(password);
-
-        telemetry_http_url = device_http_endpoint + "/telemetry";
-        command_http_url = device_http_endpoint + "/commands/control";
-    }
-
-    void update_status(const std::string& phase) {
-        std::lock_guard<std::mutex> lk(status_mutex);
-        k8s.patch_status(edgeDeviceNamespace, edgeDeviceName, phase);
-    }
-
-    void start() {
         try {
-            client.set_connected_handler([this](const std::string&) {
-                connected = true;
-                update_status("Running");
-                subscribe_topics();
-            });
-            client.set_connection_lost_handler([this](const std::string&) {
-                connected = false;
-                update_status("Pending");
-            });
-            client.set_message_callback([this](mqtt::const_message_ptr msg) {
-                this->on_message(msg);
-            });
-
-            mqtt::token_ptr conntok = client.connect(connOpts);
-            conntok->wait();
-            connected = true;
-            update_status("Running");
-        } catch (const mqtt::exception& exc) {
-            update_status("Failed");
-            std::cerr << "MQTT Connect failed: " << exc.what() << std::endl;
-            return;
+            cli_.connect(connOpts)->wait();
+            cli_.subscribe(user_cmd_topic_, qos_)->wait();
+            cli_.subscribe(device_telemetry_topic_, qos_)->wait();
+            device_status_mutex.lock();
+            device_phase = "Running";
+            device_status_mutex.unlock();
+        } catch (const mqtt::exception& e) {
+            device_status_mutex.lock();
+            device_phase = "Failed";
+            device_status_mutex.unlock();
+            throw;
         }
+    }
 
-        // Start telemetry thread
-        telemetry_thread = std::thread([this]() { telemetry_loop(); });
+    void disconnect() {
+        try { cli_.disconnect()->wait(); }
+        catch (...) {}
+        device_status_mutex.lock();
+        device_phase = "Unknown";
+        device_status_mutex.unlock();
     }
 
     void stop() {
-        stop_telemetry = true;
-        if (telemetry_thread.joinable()) {
-            telemetry_thread.join();
-        }
-        try {
-            client.disconnect()->wait();
-            update_status("Pending");
-        } catch (...) {}
+        running = false;
+        disconnect();
     }
 
-    void subscribe_topics() {
-        client.subscribe(user_topic_commands, qos);
+    void publish(const std::string& topic, const std::string& payload) {
+        mqtt::message_ptr pubmsg = mqtt::make_message(topic, payload);
+        pubmsg->set_qos(qos_);
+        cli_.publish(pubmsg);
     }
 
-    void telemetry_loop() {
-        while (!stop_telemetry) {
-            if (!connected) {
-                update_status("Pending");
-                std::this_thread::sleep_for(std::chrono::seconds(2));
-                continue;
-            }
-            std::string response;
-            bool http_ok = http.get(telemetry_http_url, response);
-            if (http_ok) {
-                device_online = true;
-                update_status("Running");
-                client.publish(user_topic_telemetry, response, qos, false);
-            } else {
-                device_online = false;
-                update_status("Failed");
-            }
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-        }
-    }
-
-    void on_message(mqtt::const_message_ptr msg) {
-        // Commands from users; forward to device via HTTP
+    // ----------------
+    // MQTT Callback(s)
+    // ----------------
+    void message_arrived(mqtt::const_message_ptr msg) override {
+        std::string topic = msg->get_topic();
         std::string payload = msg->to_string();
-        std::string http_resp;
-        bool ok = http.post(command_http_url, payload, http_resp);
-        std::string result_topic = user_topic_commands + "/response";
-        if (ok) {
-            client.publish(result_topic, http_resp, qos, false);
-        } else {
-            json err;
-            err["error"] = "Failed to send command to device";
-            client.publish(result_topic, err.dump(), qos, false);
+
+        if (topic == user_cmd_topic_) {
+            // User wants to send device command (PUBLISH)
+            handle_user_command(payload);
+        } else if (topic == device_telemetry_topic_) {
+            // Telemetry from device (SUBSCRIBE)
+            // Optionally forward to user (or process internally)
+            handle_device_telemetry(payload);
         }
     }
+
+    void connection_lost(const std::string& cause) override {
+        device_status_mutex.lock();
+        device_phase = "Failed";
+        device_status_mutex.unlock();
+    }
+
+    void delivery_complete(mqtt::delivery_token_ptr) override {}
+    void on_failure(const mqtt::token&) override {}
+    void on_success(const mqtt::token&) override {}
+
+    // ---------------
+    // Device Handlers
+    // ---------------
+
+    void handle_user_command(const std::string& payload) {
+        // Parse JSON, forward as HTTP POST to device endpoint
+        try {
+            json j = json::parse(payload);
+            std::string cmd = j.value("command", "");
+            std::string url = device_http_endpoint_ + "/commands";
+
+            std::string http_resp = http_request(url, "POST", payload, {{"Content-Type", "application/json"}});
+            if (!http_resp.empty()) {
+                publish(device_cmd_topic_, http_resp);
+            } else {
+                publish(device_cmd_topic_, R"({"error":"Device HTTP request failed"})");
+            }
+        } catch (...) {
+            publish(device_cmd_topic_, R"({"error":"Invalid command payload"})");
+        }
+    }
+
+    void handle_device_telemetry(const std::string& payload) {
+        // Forward telemetry to user on a topic (or process as needed)
+        publish(device_telemetry_topic_ + "/user", payload);
+    }
+
+    // ---------------
+    // Telemetry Poll
+    // ---------------
+
+    void telemetry_poller() {
+        while (running) {
+            std::string url = device_http_endpoint_ + "/telemetry";
+            std::string resp = http_request(url, "GET");
+            if (!resp.empty()) {
+                publish(device_telemetry_topic_, resp);
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(DEVICE_TELEMETRY_POLL_INTERVAL));
+        }
+    }
+
+private:
+    mqtt::async_client cli_;
+    std::string user_cmd_topic_;
+    std::string device_telemetry_topic_;
+    std::string device_cmd_topic_;
+    std::string device_http_endpoint_;
+    int qos_;
+    InstructionConfigMap& instruction_config_;
 };
 
-// --------- MAIN -------------------
+// -----------------------------
+// Signal Handler
+// -----------------------------
+
+void sig_handler(int) {
+    running = false;
+}
+
+// -----------------------------
+// Main Entrypoint
+// -----------------------------
+
 int main() {
+    signal(SIGTERM, sig_handler);
+    signal(SIGINT, sig_handler);
+
+    // Env vars for Kubernetes/EdgeDevice
+    std::string EDGEDEVICE_NAME = getenvOrFail("EDGEDEVICE_NAME");
+    std::string EDGEDEVICE_NAMESPACE = getenvOrFail("EDGEDEVICE_NAMESPACE");
+
+    // MQTT config from env
+    std::string MQTT_BROKER = getenvOrFail("MQTT_BROKER");
+    std::string MQTT_CLIENT_ID = getenvOrFail("MQTT_CLIENT_ID");
+    std::string MQTT_USER_CMD_TOPIC = getenvOrFail("MQTT_USER_CMD_TOPIC");            // e.g., device/commands/control
+    std::string MQTT_DEVICE_TELEMETRY_TOPIC = getenvOrFail("MQTT_DEVICE_TELEMETRY_TOPIC"); // e.g., device/telemetry
+    std::string MQTT_DEVICE_CMD_TOPIC = getenvOrFail("MQTT_DEVICE_CMD_TOPIC");        // e.g., device/commands/result
+
+    // HTTP endpoint config
+    std::string DEVICE_HTTP_ENDPOINT = getenvOrFail("DEVICE_HTTP_ENDPOINT"); // e.g., http://127.0.0.1:8080
+
+    // Instruction config
+    InstructionConfigMap instruction_config = load_instruction_config(CONFIG_PATH);
+
+    // Read device address from EdgeDevice CRD (optional, if needed)
+    // For this implementation, DEVICE_HTTP_ENDPOINT is passed via env vars.
+
+    // Initialize curl
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    // Start EdgeDevice status update thread
+    std::thread status_updater(device_status_updater, EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE);
+
+    // Start MQTT<->HTTP Bridge
+    MqttDeviceBridge bridge(
+        MQTT_BROKER, MQTT_CLIENT_ID,
+        MQTT_USER_CMD_TOPIC,
+        MQTT_DEVICE_TELEMETRY_TOPIC,
+        MQTT_DEVICE_CMD_TOPIC,
+        DEVICE_HTTP_ENDPOINT,
+        instruction_config
+    );
+
     try {
-        std::string edgeDeviceName = getenv_or_throw("EDGEDEVICE_NAME");
-        std::string edgeDeviceNamespace = getenv_or_throw("EDGEDEVICE_NAMESPACE");
-
-        std::string mqtt_broker = getenv_or_throw("MQTT_BROKER_ADDRESS");
-        std::string mqtt_client_id = getenv_or_default("MQTT_CLIENT_ID", "device-shifu-lite3");
-        std::string mqtt_cmd_topic = getenv_or_default("MQTT_COMMAND_TOPIC", "device/commands/control");
-        std::string mqtt_telem_topic = getenv_or_default("MQTT_TELEMETRY_TOPIC", "device/telemetry");
-        int mqtt_qos = std::stoi(getenv_or_default("MQTT_QOS", "1"));
-
-        std::string config_path = "/etc/edgedevice/config/instructions";
-        InstructionConfig config = InstructionConfig::Load(config_path);
-
-        // K8s client to get device HTTP endpoint (from .spec.address)
-        K8sClient k8s;
-        std::string device_http_endpoint = k8s.get_device_address(edgeDeviceNamespace, edgeDeviceName);
-        if (device_http_endpoint.empty()) {
-            throw std::runtime_error("Device HTTP endpoint address missing in EdgeDevice.spec.address");
-        }
-
-        MqttBridge bridge(
-            mqtt_broker, mqtt_client_id,
-            mqtt_telem_topic, mqtt_cmd_topic,
-            device_http_endpoint,
-            mqtt_qos,
-            config,
-            edgeDeviceName, edgeDeviceNamespace
-        );
-
-        bridge.update_status("Pending");
-        bridge.start();
-
-        // Wait for SIGTERM/SIGINT
-        std::atomic<bool> running(true);
-        std::signal(SIGINT, [](int){ std::exit(0); });
-        std::signal(SIGTERM, [](int){ std::exit(0); });
-        while (running) std::this_thread::sleep_for(std::chrono::seconds(1));
-
-        bridge.stop();
-
-    } catch (const std::exception& ex) {
-        std::cerr << "DeviceShifu driver failed: " << ex.what() << std::endl;
-        return 1;
+        bridge.connect();
+    } catch (...) {
+        device_status_mutex.lock();
+        device_phase = "Failed";
+        device_status_mutex.unlock();
+        running = false;
     }
+
+    // Start telemetry poller
+    std::thread telemetry_thread(&MqttDeviceBridge::telemetry_poller, &bridge);
+
+    // Main loop
+    while (running) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    // Cleanup
+    bridge.stop();
+    telemetry_thread.join();
+    status_updater.join();
+    curl_global_cleanup();
     return 0;
 }
