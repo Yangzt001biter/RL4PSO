@@ -1,248 +1,279 @@
 import os
 import sys
 import yaml
-import time
 import json
-import threading
+import asyncio
+import signal
 import logging
+import threading
 
 import requests
+from kubernetes import client, config
+from kubernetes.client import ApiException
 import paho.mqtt.client as mqtt
 
-from kubernetes import client, config
+# Logging setup
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s %(message)s'
+)
 
-# Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("DeviceShifu")
-
-# Environment variables
+# Environment Variables
 EDGEDEVICE_NAME = os.environ['EDGEDEVICE_NAME']
 EDGEDEVICE_NAMESPACE = os.environ['EDGEDEVICE_NAMESPACE']
-MQTT_BROKER = os.environ['MQTT_BROKER']
-MQTT_PORT = int(os.environ.get('MQTT_PORT', 1883))
+MQTT_BROKER_HOST = os.environ.get('MQTT_BROKER_HOST', 'localhost')
+MQTT_BROKER_PORT = int(os.environ.get('MQTT_BROKER_PORT', '1883'))
 MQTT_USERNAME = os.environ.get('MQTT_USERNAME', None)
 MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD', None)
-MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', "device-shifu-client")
-MQTT_KEEPALIVE = int(os.environ.get('MQTT_KEEPALIVE', 60))
-TELEMETRY_PUB_INTERVAL = int(os.environ.get('TELEMETRY_PUB_INTERVAL', 2))
-INSTRUCTION_PATH = '/etc/edgedevice/config/instructions'
+MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'device-shifu-mqtt-client')
+MQTT_KEEPALIVE = int(os.environ.get('MQTT_KEEPALIVE', '60'))
+MQTT_TELEMETRY_INTERVAL_SEC = int(os.environ.get('MQTT_TELEMETRY_INTERVAL_SEC', '2'))
 
-# MQTT Topics (can be overridden by env)
-TOPIC_COMMAND_ESTOP = os.environ.get('TOPIC_COMMAND_ESTOP', 'device/commands/estop')
-TOPIC_COMMAND_STATE = os.environ.get('TOPIC_COMMAND_STATE', 'device/commands/state')
-TOPIC_COMMAND_ACTION = os.environ.get('TOPIC_COMMAND_ACTION', 'device/commands/action')
-TOPIC_TELEMETRY_DATA = os.environ.get('TOPIC_TELEMETRY_DATA', 'device/telemetry/data')
-TOPIC_TELEMETRY_STATUS = os.environ.get('TOPIC_TELEMETRY_STATUS', 'device/telemetry/status')
+CONFIGMAP_INSTRUCTIONS_PATH = '/etc/edgedevice/config/instructions'
 
-# DeviceShifu <--> Real Device HTTP
-HTTP_TIMEOUT = int(os.environ.get('HTTP_TIMEOUT', 5))
+# DeviceShifu MQTT topics & QoS
+TOPICS = {
+    "device/commands/estop": 1,      # publish
+    "device/commands/state": 1,      # publish
+    "device/commands/action": 1,     # publish
+    "device/telemetry/data": 1,      # subscribe
+    "device/telemetry/status": 1     # subscribe
+}
+# All topics can be made configurable via env, but using these as default per requirements.
 
-# Kubernetes client setup (in-cluster)
-def k8s_init():
+# Kubernetes API setup
+def load_k8s_config():
     try:
         config.load_incluster_config()
     except Exception as e:
-        logger.error(f"K8s incluster config failed: {e}")
+        logging.error("Could not load in-cluster k8s config: %s", e)
         sys.exit(1)
-    return client.CustomObjectsApi()
 
-k8s_api = k8s_init()
+load_k8s_config()
+crd_api = client.CustomObjectsApi()
 
-# CRD constants
-CRD_GROUP = "shifu.edgenesis.io"
-CRD_VERSION = "v1alpha1"
-CRD_PLURAL = "edgedevices"
-
+# Helper to update EdgeDevice phase
 def update_edge_device_phase(phase):
-    """Update .status.edgeDevicePhase in EdgeDevice CR."""
-    for _ in range(3):
-        try:
-            body = {'status': {'edgeDevicePhase': phase}}
-            k8s_api.patch_namespaced_custom_object_status(
-                group=CRD_GROUP,
-                version=CRD_VERSION,
-                namespace=EDGEDEVICE_NAMESPACE,
-                plural=CRD_PLURAL,
-                name=EDGEDEVICE_NAME,
-                body=body
-            )
-            logger.info(f"Updated EdgeDevice status.phase to {phase}")
-            return
-        except Exception as e:
-            logger.warning(f"Failed to update EdgeDevice phase: {e}")
-            time.sleep(1)
-    logger.error("Giving up updating EdgeDevice status after 3 tries.")
-
-def get_device_address():
-    """Fetch .spec.address from EdgeDevice CR"""
     try:
-        obj = k8s_api.get_namespaced_custom_object(
-            group=CRD_GROUP,
-            version=CRD_VERSION,
+        body = {"status": {"edgeDevicePhase": phase}}
+        crd_api.patch_namespaced_custom_object_status(
+            group="shifu.edgenesis.io",
+            version="v1alpha1",
             namespace=EDGEDEVICE_NAMESPACE,
-            plural=CRD_PLURAL,
+            plural="edgedevices",
+            name=EDGEDEVICE_NAME,
+            body=body
+        )
+        logging.info(f"Updated EdgeDevice phase to {phase}")
+    except ApiException as e:
+        logging.error(f"Failed to update EdgeDevice phase: {e}")
+
+# Helper to get EdgeDevice CRD
+def get_edge_device_crd():
+    try:
+        return crd_api.get_namespaced_custom_object(
+            group="shifu.edgenesis.io",
+            version="v1alpha1",
+            namespace=EDGEDEVICE_NAMESPACE,
+            plural="edgedevices",
             name=EDGEDEVICE_NAME
         )
-        address = obj['spec']['address']
-        logger.info(f"Device HTTP address: {address}")
-        return address
-    except Exception as e:
-        logger.error(f"Error fetching EdgeDevice address: {e}")
-        update_edge_device_phase("Unknown")
-        sys.exit(1)
+    except ApiException as e:
+        logging.error("Could not get EdgeDevice CRD: %s", e)
+        return None
 
-def load_instruction_config():
-    path = os.path.join(INSTRUCTION_PATH, "instructions.yaml")
+# Load instruction settings from ConfigMap (YAML)
+def load_instruction_settings():
     try:
-        with open(path, 'r') as f:
-            cfg = yaml.safe_load(f)
-        logger.info("Loaded instruction config successfully.")
-        return cfg
+        with open(CONFIGMAP_INSTRUCTIONS_PATH, 'r') as f:
+            return yaml.safe_load(f)
     except Exception as e:
-        logger.warning(f"Failed to load instruction config: {e}")
+        logging.warning("Could not load instruction settings: %s", e)
         return {}
 
-instruction_cfg = load_instruction_config()
-device_http_addr = get_device_address()
+instruction_settings = load_instruction_settings()
 
-# MQTT <-> Device HTTP protocol mapping
-def device_http_post(endpoint, data):
-    url = f"{device_http_addr.rstrip('/')}/{endpoint.lstrip('/')}"
-    try:
-        response = requests.post(url, json=data, timeout=HTTP_TIMEOUT)
-        response.raise_for_status()
-        return response.json(), None
-    except Exception as e:
-        logger.warning(f"HTTP POST {url} failed: {e}")
-        return None, str(e)
+# Device address (HTTP endpoint)
+edge_device = get_edge_device_crd()
+if edge_device is None:
+    logging.error("Fatal: Could not get EdgeDevice CRD on startup. Exiting.")
+    sys.exit(1)
 
-def device_http_get(endpoint):
-    url = f"{device_http_addr.rstrip('/')}/{endpoint.lstrip('/')}"
-    try:
-        response = requests.get(url, timeout=HTTP_TIMEOUT)
-        response.raise_for_status()
-        return response.json(), None
-    except Exception as e:
-        logger.warning(f"HTTP GET {url} failed: {e}")
-        return None, str(e)
+device_address = edge_device.get('spec', {}).get('address', None)
+if not device_address:
+    logging.error("Fatal: Device address (.spec.address) not found in EdgeDevice CRD. Exiting.")
+    sys.exit(1)
 
-# MQTT setup
-mqtt_client = mqtt.Client(client_id=MQTT_CLIENT_ID, clean_session=True)
-if MQTT_USERNAME:
-    mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+# --- MQTT Handlers ---
 
-mqtt_connected = threading.Event()
+class DeviceShifuMQTTClient:
+    def __init__(self):
+        self.client = mqtt.Client(MQTT_CLIENT_ID)
+        if MQTT_USERNAME:
+            self.client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
+        self.client.on_connect = self.on_connect
+        self.client.on_disconnect = self.on_disconnect
+        self.client.on_message = self.on_message
 
-def on_connect(client, userdata, flags, rc):
-    if rc == 0:
-        logger.info("MQTT connected successfully.")
-        mqtt_connected.set()
-        update_edge_device_phase("Running")
-        # Subscribe to command topics
-        client.subscribe([(TOPIC_COMMAND_ESTOP, 1), (TOPIC_COMMAND_STATE, 1), (TOPIC_COMMAND_ACTION, 1)])
-    else:
-        logger.error(f"MQTT connection failed: {rc}")
-        update_edge_device_phase("Failed")
+        self.connected = False
+        self.should_stop = False
 
-def on_disconnect(client, userdata, rc):
-    logger.warning("MQTT disconnected.")
-    update_edge_device_phase("Pending")
-    mqtt_connected.clear()
+        # Track last known device phase
+        self.device_phase = "Pending"
+        update_edge_device_phase(self.device_phase)
 
-def on_message(client, userdata, msg):
-    topic = msg.topic
-    payload = msg.payload.decode()
-    logger.info(f"Received MQTT message: topic={topic}, payload={payload}")
-    try:
-        data = json.loads(payload)
-    except Exception as e:
-        logger.warning(f"Invalid JSON payload: {e}")
-        return
+        # Start background telemetry task
+        self.telemetry_thread = threading.Thread(target=self.telemetry_publisher_loop)
+        self.telemetry_thread.daemon = True
 
-    if topic == TOPIC_COMMAND_ESTOP:
-        handle_command_estop(client, data)
-    elif topic == TOPIC_COMMAND_STATE:
-        handle_command_state(client, data)
-    elif topic == TOPIC_COMMAND_ACTION:
-        handle_command_action(client, data)
-
-def handle_command_estop(client, data):
-    endpoint = instruction_cfg.get('api1', {}).get('protocolPropertyList', {}).get('endpoint', 'estop')
-    resp, err = device_http_post(endpoint, data)
-    publish_result(client, TOPIC_COMMAND_ESTOP + "/result", resp, err)
-
-def handle_command_state(client, data):
-    endpoint = instruction_cfg.get('api2', {}).get('protocolPropertyList', {}).get('endpoint', 'state')
-    resp, err = device_http_post(endpoint, data)
-    publish_result(client, TOPIC_COMMAND_STATE + "/result", resp, err)
-
-def handle_command_action(client, data):
-    endpoint = instruction_cfg.get('api3', {}).get('protocolPropertyList', {}).get('endpoint', 'action')
-    resp, err = device_http_post(endpoint, data)
-    publish_result(client, TOPIC_COMMAND_ACTION + "/result", resp, err)
-
-def publish_result(client, topic, resp, err):
-    result = {
-        "success": err is None,
-        "response": resp if err is None else None,
-        "error": err
-    }
-    client.publish(topic, json.dumps(result), qos=1)
-
-def telemetry_publisher():
-    """Periodically publish telemetry data and status."""
-    while True:
-        # Telemetry data
-        endpoint_data = instruction_cfg.get('api4', {}).get('protocolPropertyList', {}).get('endpoint', 'telemetry/data')
-        data, err = device_http_get(endpoint_data)
-        payload = json.dumps(data) if data else json.dumps({"error": err})
-        mqtt_client.publish(TOPIC_TELEMETRY_DATA, payload, qos=1)
-
-        # Telemetry status
-        endpoint_status = instruction_cfg.get('api5', {}).get('protocolPropertyList', {}).get('endpoint', 'telemetry/status')
-        status, err = device_http_get(endpoint_status)
-        payload = json.dumps(status) if status else json.dumps({"error": err})
-        mqtt_client.publish(TOPIC_TELEMETRY_STATUS, payload, qos=1)
-
-        time.sleep(TELEMETRY_PUB_INTERVAL)
-
-def main():
-    mqtt_client.on_connect = on_connect
-    mqtt_client.on_disconnect = on_disconnect
-    mqtt_client.on_message = on_message
-
-    update_edge_device_phase("Pending")
-    while True:
+    def connect(self):
         try:
-            mqtt_client.connect(MQTT_BROKER, MQTT_PORT, MQTT_KEEPALIVE)
-            break
+            self.client.connect(MQTT_BROKER_HOST, MQTT_BROKER_PORT, MQTT_KEEPALIVE)
+            self.client.loop_start()
+            self.telemetry_thread.start()
         except Exception as e:
-            logger.warning(f"MQTT connect failed: {e}")
+            logging.error("MQTT Connection failed: %s", e)
             update_edge_device_phase("Failed")
-            time.sleep(3)
+            sys.exit(1)
 
-    # Start MQTT loop
-    mqtt_client.loop_start()
-
-    # Wait for MQTT connection
-    if not mqtt_connected.wait(timeout=15):
-        logger.error("MQTT connection timeout.")
-        update_edge_device_phase("Failed")
-        sys.exit(1)
-
-    # Start telemetry publishing thread
-    telemetry_thread = threading.Thread(target=telemetry_publisher, daemon=True)
-    telemetry_thread.start()
-
-    try:
-        while True:
-            time.sleep(3600)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
+    def disconnect(self):
+        self.should_stop = True
+        self.client.loop_stop()
+        self.client.disconnect()
         update_edge_device_phase("Pending")
 
-if __name__ == '__main__':
-    main()
+    def on_connect(self, client, userdata, flags, rc):
+        if rc == 0:
+            logging.info("Connected to MQTT broker")
+            self.connected = True
+            update_edge_device_phase("Running")
+            for topic, qos in TOPICS.items():
+                if topic.startswith("device/telemetry/"):
+                    self.client.subscribe(topic, qos)
+                    logging.info(f"Subscribed to topic: {topic} (QoS {qos})")
+        else:
+            logging.error(f"Failed to connect to MQTT broker: {rc}")
+            update_edge_device_phase("Failed")
+
+    def on_disconnect(self, client, userdata, rc):
+        self.connected = False
+        update_edge_device_phase("Pending")
+        logging.warning(f"MQTT Disconnected with rc={rc}")
+
+    def on_message(self, client, userdata, msg):
+        topic = msg.topic
+        try:
+            payload = msg.payload.decode('utf-8')
+            data = json.loads(payload)
+        except Exception as e:
+            logging.warning(f"Invalid JSON on topic {topic}: {e}")
+            return
+
+        if topic == "device/telemetry/data":
+            # User does not send to this topic, ignore
+            return
+        if topic == "device/telemetry/status":
+            # User does not send to this topic, ignore
+            return
+
+        # Handle command topics
+        if topic == "device/commands/estop":
+            self.handle_estop_command(data)
+        elif topic == "device/commands/state":
+            self.handle_state_command(data)
+        elif topic == "device/commands/action":
+            self.handle_action_command(data)
+        else:
+            logging.warning(f"Unknown topic: {topic}")
+
+    # --- Command Handlers ---
+
+    def handle_estop_command(self, data):
+        settings = instruction_settings.get('api1', {}).get('protocolPropertyList', {})
+        url = f"{device_address}/estop"
+        try:
+            resp = requests.post(url, json=data, timeout=5)
+            self.publish_result("device/commands/estop/response", resp)
+        except Exception as e:
+            self.publish_error("device/commands/estop/response", str(e))
+
+    def handle_state_command(self, data):
+        settings = instruction_settings.get('api2', {}).get('protocolPropertyList', {})
+        url = f"{device_address}/state"
+        try:
+            resp = requests.post(url, json=data, timeout=5)
+            self.publish_result("device/commands/state/response", resp)
+        except Exception as e:
+            self.publish_error("device/commands/state/response", str(e))
+
+    def handle_action_command(self, data):
+        settings = instruction_settings.get('api3', {}).get('protocolPropertyList', {})
+        url = f"{device_address}/action"
+        try:
+            resp = requests.post(url, json=data, timeout=5)
+            self.publish_result("device/commands/action/response", resp)
+        except Exception as e:
+            self.publish_error("device/commands/action/response", str(e))
+
+    def publish_result(self, topic, resp):
+        try:
+            payload = {
+                "status_code": resp.status_code,
+                "response": resp.json() if resp.headers.get("Content-Type", "").startswith("application/json") else resp.text
+            }
+        except Exception:
+            payload = {
+                "status_code": getattr(resp, 'status_code', None),
+                "response": resp.text if hasattr(resp, 'text') else str(resp)
+            }
+        self.client.publish(topic, json.dumps(payload), qos=1)
+
+    def publish_error(self, topic, err_msg):
+        self.client.publish(topic, json.dumps({"error": err_msg}), qos=1)
+
+    # --- Telemetry Publisher ---
+
+    def telemetry_publisher_loop(self):
+        while not self.should_stop:
+            try:
+                # Telemetry: /data (aggregated sensor data)
+                url_data = f"{device_address}/telemetry/data"
+                resp_data = requests.get(url_data, timeout=5)
+                if resp_data.status_code == 200:
+                    payload = resp_data.json() if resp_data.headers.get("Content-Type", "").startswith("application/json") else resp_data.text
+                    self.client.publish("device/telemetry/data", json.dumps(payload), qos=1)
+                # Telemetry: /status (overall robot status)
+                url_status = f"{device_address}/telemetry/status"
+                resp_status = requests.get(url_status, timeout=5)
+                if resp_status.status_code == 200:
+                    payload = resp_status.json() if resp_status.headers.get("Content-Type", "").startswith("application/json") else resp_status.text
+                    self.client.publish("device/telemetry/status", json.dumps(payload), qos=1)
+            except Exception as e:
+                logging.warning(f"Telemetry publish error: {e}")
+                update_edge_device_phase("Unknown")
+            finally:
+                for _ in range(MQTT_TELEMETRY_INTERVAL_SEC * 10):
+                    if self.should_stop:
+                        return
+                    asyncio.sleep(0.1)
+
+# Graceful shutdown handler
+def signal_handler(sig, frame):
+    logging.info("Terminating DeviceShifu driver...")
+    shifu.disconnect()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
+
+# --- Main ---
+
+if __name__ == "__main__":
+    shifu = DeviceShifuMQTTClient()
+    shifu.connect()
+    while True:
+        try:
+            # Keep alive
+            signal.pause()
+        except KeyboardInterrupt:
+            signal_handler(None, None)
