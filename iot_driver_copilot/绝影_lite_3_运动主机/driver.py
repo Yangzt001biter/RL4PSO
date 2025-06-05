@@ -1,244 +1,234 @@
 import os
+import sys
+import time
 import yaml
-import asyncio
-import logging
 import json
-import signal
+import threading
+import traceback
+
+import paho.mqtt.client as mqtt
+import requests
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
 
-import paho.mqtt.client as mqtt
-import aiohttp
+INSTRUCTIONS_PATH = '/etc/edgedevice/config/instructions'
+EDGEDEVICE_CRD_GROUP = 'shifu.edgenesis.io'
+EDGEDEVICE_CRD_VERSION = 'v1alpha1'
+EDGEDEVICE_CRD_PLURAL = 'edgedevices'
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("DeviceShifuLite3")
+STATUS_PENDING = "Pending"
+STATUS_RUNNING = "Running"
+STATUS_FAILED = "Failed"
+STATUS_UNKNOWN = "Unknown"
 
-# Environment variables (all required to run)
-EDGEDEVICE_NAME = os.environ["EDGEDEVICE_NAME"]
-EDGEDEVICE_NAMESPACE = os.environ["EDGEDEVICE_NAMESPACE"]
-MQTT_BROKER = os.environ["MQTT_BROKER"]
-MQTT_PORT = int(os.environ.get("MQTT_PORT", "1883"))
-MQTT_USERNAME = os.environ.get("MQTT_USERNAME")
-MQTT_PASSWORD = os.environ.get("MQTT_PASSWORD")
-MQTT_TELEMETRY_TOPIC = os.environ.get("MQTT_TELEMETRY_TOPIC", "device/telemetry/state")
-MQTT_COMMAND_TOPIC = os.environ.get("MQTT_COMMAND_TOPIC", "device/commands/control")
-MQTT_RESPONSE_TOPIC = os.environ.get("MQTT_RESPONSE_TOPIC", "device/commands/response")
-MQTT_QOS = int(os.environ.get("MQTT_QOS", "1"))
-CONFIG_INSTRUCTIONS_PATH = "/etc/edgedevice/config/instructions"
-# No device HTTP endpoint env - will get from EdgeDevice CRD
+# Load configuration from environment variables
+MQTT_BROKER_ADDRESS = os.environ.get('MQTT_BROKER_ADDRESS', 'localhost')
+MQTT_BROKER_PORT = int(os.environ.get('MQTT_BROKER_PORT', '1883'))
+MQTT_USERNAME = os.environ.get('MQTT_USERNAME', '')
+MQTT_PASSWORD = os.environ.get('MQTT_PASSWORD', '')
+MQTT_CLIENT_ID = os.environ.get('MQTT_CLIENT_ID', 'device-shifu-lite3')
+MQTT_KEEPALIVE = int(os.environ.get('MQTT_KEEPALIVE', '60'))
+MQTT_COMMANDS_TOPIC = os.environ.get('MQTT_COMMANDS_TOPIC', 'device/commands/control')
+MQTT_TELEMETRY_TOPIC = os.environ.get('MQTT_TELEMETRY_TOPIC', 'device/telemetry/state')
+MQTT_TELEMETRY_RESULT_TOPIC = os.environ.get('MQTT_TELEMETRY_RESULT_TOPIC', 'device/telemetry/result')
+MQTT_COMMANDS_RESULT_TOPIC = os.environ.get('MQTT_COMMANDS_RESULT_TOPIC', 'device/commands/result')
 
-# Kubernetes CRD Constants
-CRD_GROUP = "shifu.edgenesis.io"
-CRD_VERSION = "v1alpha1"
-CRD_PLURAL = "edgedevices"
+EDGEDEVICE_NAME = os.environ['EDGEDEVICE_NAME']
+EDGEDEVICE_NAMESPACE = os.environ['EDGEDEVICE_NAMESPACE']
 
-class EdgeDeviceStatusUpdater:
-    def __init__(self, device_name, namespace):
-        config.load_incluster_config()
-        self.api = client.CustomObjectsApi()
-        self.device_name = device_name
-        self.namespace = namespace
+# Kubernetes in-cluster config
+config.load_incluster_config()
+k8s_api = client.CustomObjectsApi()
 
-    async def set_phase(self, phase):
-        # Patch the CRD status
-        patch = {"status": {"edgeDevicePhase": phase}}
+def get_edgedevice():
+    try:
+        ed = k8s_api.get_namespaced_custom_object(
+            group=EDGEDEVICE_CRD_GROUP,
+            version=EDGEDEVICE_CRD_VERSION,
+            namespace=EDGEDEVICE_NAMESPACE,
+            plural=EDGEDEVICE_CRD_PLURAL,
+            name=EDGEDEVICE_NAME
+        )
+        return ed
+    except Exception as e:
+        return None
+
+def update_edgedevice_phase(phase):
+    retry = 0
+    while retry < 3:
         try:
-            self.api.patch_namespaced_custom_object_status(
-                group=CRD_GROUP,
-                version=CRD_VERSION,
-                namespace=self.namespace,
-                plural=CRD_PLURAL,
-                name=self.device_name,
-                body=patch,
+            body = {"status": {"edgeDevicePhase": phase}}
+            k8s_api.patch_namespaced_custom_object_status(
+                group=EDGEDEVICE_CRD_GROUP,
+                version=EDGEDEVICE_CRD_VERSION,
+                namespace=EDGEDEVICE_NAMESPACE,
+                plural=EDGEDEVICE_CRD_PLURAL,
+                name=EDGEDEVICE_NAME,
+                body=body
             )
-            logger.info(f"Set EdgeDevice status.phase to {phase}")
+            return True
         except ApiException as e:
-            logger.error(f"Failed to update EdgeDevice phase: {e}")
-
-    def get_device_address(self):
-        try:
-            obj = self.api.get_namespaced_custom_object(
-                group=CRD_GROUP,
-                version=CRD_VERSION,
-                namespace=self.namespace,
-                plural=CRD_PLURAL,
-                name=self.device_name,
-            )
-            return obj["spec"]["address"]
+            retry += 1
+            time.sleep(1)
         except Exception as e:
-            logger.error(f"Unable to get device address from EdgeDevice CRD: {e}")
-            return None
+            break
+    return False
+
+def get_device_address():
+    ed = get_edgedevice()
+    if ed is None:
+        return None
+    return ed.get('spec', {}).get('address', None)
+
+def load_instruction_config():
+    try:
+        with open(INSTRUCTIONS_PATH, "r") as f:
+            raw = f.read()
+            return yaml.safe_load(raw)
+    except Exception:
+        return {}
+
+# Device connectivity check
+def check_device_connection(device_address):
+    try:
+        # Try GET /health or /status or root (as available)
+        url = f"{device_address.rstrip('/')}/health"
+        r = requests.get(url, timeout=2)
+        if r.status_code == 200:
+            return True
+    except Exception:
+        pass
+    try:
+        url = f"{device_address.rstrip('/')}/status"
+        r = requests.get(url, timeout=2)
+        if r.status_code == 200:
+            return True
+    except Exception:
+        pass
+    try:
+        url = device_address.rstrip('/')
+        r = requests.get(url, timeout=2)
+        if r.status_code == 200:
+            return True
+    except Exception:
+        pass
+    return False
 
 class DeviceShifuLite3:
     def __init__(self):
-        self.updater = EdgeDeviceStatusUpdater(EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE)
-        self.config = self.load_instruction_config()
-        self.device_address = None
         self.mqtt_client = None
-        self.aiohttp_session = aiohttp.ClientSession()
-        self.loop = asyncio.get_event_loop()
-        self.connected = asyncio.Event()
-        self.stop_event = asyncio.Event()
-
-    def load_instruction_config(self):
-        config_path = os.path.join(CONFIG_INSTRUCTIONS_PATH, "instructions.yaml")
-        try:
-            with open(config_path, "r") as f:
-                return yaml.safe_load(f)
-        except Exception as e:
-            logger.error(f"Failed to load instruction config: {e}")
-            return {}
+        self.running = True
+        self.device_address = None
+        self.instruction_config = load_instruction_config()
+        self.device_connected = False
+        self.last_status = STATUS_UNKNOWN
 
     def start(self):
-        self.loop.run_until_complete(self.main())
+        # Periodic device connection check and phase update
+        threading.Thread(target=self.device_status_monitor, daemon=True).start()
+        # MQTT thread
+        self.init_mqtt()
+        while self.running:
+            time.sleep(1)
 
-    async def main(self):
-        # Step 1: Get device address from EdgeDevice CRD
-        await self.updater.set_phase("Pending")
-        self.device_address = self.updater.get_device_address()
-        if not self.device_address:
-            await self.updater.set_phase("Unknown")
-            return
-
-        # Step 2: Connect to MQTT broker
-        await self.updater.set_phase("Pending")
-        if not await self.connect_mqtt():
-            await self.updater.set_phase("Failed")
-            return
-
-        await self.updater.set_phase("Running")
-        logger.info("DeviceShifuLite3 started and running.")
-
-        # Step 3: Start telemetry polling
-        telemetry_task = self.loop.create_task(self.poll_telemetry())
-
-        # Step 4: Wait for stop event (SIGTERM/SIGINT)
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            self.loop.add_signal_handler(sig, lambda: asyncio.ensure_future(self.shutdown()))
-        await self.stop_event.wait()
-        telemetry_task.cancel()
-        await self.aiohttp_session.close()
-        self.mqtt_client.disconnect()
-        await asyncio.sleep(0.5)
-
-    async def shutdown(self):
-        logger.info("Shutting down DeviceShifuLite3 ...")
-        await self.updater.set_phase("Unknown")
-        self.stop_event.set()
-
-    async def connect_mqtt(self):
-        connected_event = asyncio.Event()
-
-        def on_connect(client, userdata, flags, rc):
-            if rc == 0:
-                logger.info("Connected to MQTT broker")
-                connected_event.set()
-                # Subscribe to command topic
-                client.subscribe(MQTT_COMMAND_TOPIC, qos=MQTT_QOS)
+    def device_status_monitor(self):
+        while self.running:
+            ed = get_edgedevice()
+            if ed is None:
+                phase = STATUS_UNKNOWN
+                self.device_address = None
             else:
-                logger.error(f"MQTT connection failed (rc={rc})")
+                self.device_address = ed.get('spec', {}).get('address', None)
+                if self.device_address is None:
+                    phase = STATUS_PENDING
+                else:
+                    connected = check_device_connection(self.device_address)
+                    if connected:
+                        phase = STATUS_RUNNING
+                        self.device_connected = True
+                    else:
+                        phase = STATUS_FAILED
+                        self.device_connected = False
+            if phase != self.last_status:
+                update_edgedevice_phase(phase)
+                self.last_status = phase
+            time.sleep(5)
 
-        def on_disconnect(client, userdata, rc):
-            logger.warning("Disconnected from MQTT broker")
-            self.loop.create_task(self.updater.set_phase("Pending"))
-
-        def on_message(client, userdata, msg):
-            self.loop.create_task(self.handle_mqtt_command(msg))
-
-        self.mqtt_client = mqtt.Client()
+    def init_mqtt(self):
+        self.mqtt_client = mqtt.Client(MQTT_CLIENT_ID)
         if MQTT_USERNAME:
             self.mqtt_client.username_pw_set(MQTT_USERNAME, MQTT_PASSWORD)
-        self.mqtt_client.on_connect = on_connect
-        self.mqtt_client.on_disconnect = on_disconnect
-        self.mqtt_client.on_message = on_message
+        self.mqtt_client.on_connect = self.on_connect
+        self.mqtt_client.on_message = self.on_message
+        self.mqtt_client.on_disconnect = self.on_disconnect
+        self.mqtt_client.connect_async(MQTT_BROKER_ADDRESS, MQTT_BROKER_PORT, MQTT_KEEPALIVE)
+        self.mqtt_client.loop_start()
 
-        try:
-            self.mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            # Use loop_start for threading, but manage shutdown via asyncio
-            self.mqtt_client.loop_start()
+    def on_connect(self, client, userdata, flags, rc):
+        # Subscribe to commands and telemetry requests
+        client.subscribe(MQTT_COMMANDS_TOPIC, qos=1)
+        client.subscribe(MQTT_TELEMETRY_TOPIC, qos=1)
+
+    def on_disconnect(self, client, userdata, rc):
+        # Try to reconnect
+        while self.running:
             try:
-                await asyncio.wait_for(connected_event.wait(), timeout=10)
-                return True
-            except asyncio.TimeoutError:
-                logger.error("Timeout connecting to MQTT broker")
-                return False
-        except Exception as e:
-            logger.error(f"Failed to connect to MQTT broker: {e}")
-            return False
+                client.reconnect()
+                break
+            except Exception:
+                time.sleep(2)
 
-    async def poll_telemetry(self):
-        interval = int(self.config.get("device/telemetry/state", {})
-                       .get("protocolPropertyList", {}).get("pollingInterval", 2))
-        while True:
-            await asyncio.sleep(interval)
-            try:
-                telemetry = await self.fetch_telemetry()
-                if telemetry is not None:
-                    self.mqtt_client.publish(
-                        MQTT_TELEMETRY_TOPIC,
-                        json.dumps(telemetry),
-                        qos=MQTT_QOS,
-                    )
-            except Exception as e:
-                logger.error(f"Polling telemetry failed: {e}")
-
-    async def fetch_telemetry(self):
-        # HTTP GET telemetry endpoint
-        url = f"http://{self.device_address}/api/v1/telemetry"
-        try:
-            async with self.aiohttp_session.get(url, timeout=3) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data
-                else:
-                    logger.error(f"Failed to fetch telemetry: HTTP {resp.status}")
-        except Exception as e:
-            logger.error(f"Error getting telemetry: {e}")
-        return None
-
-    async def handle_mqtt_command(self, msg):
-        # Payload expected: { "command": "...", "params": {...} }
+    def on_message(self, client, userdata, msg):
         try:
             payload = msg.payload.decode()
-            command_obj = json.loads(payload)
-            # Optionally consult config for command mapping/settings
-            result = await self.send_device_command(command_obj)
-            response = {
-                "status": "success" if result else "failure",
-                "command": command_obj.get("command"),
-                "result": result
-            }
+            if msg.topic == MQTT_COMMANDS_TOPIC:
+                # User sent a device command
+                resp = self.handle_command(payload)
+                client.publish(MQTT_COMMANDS_RESULT_TOPIC, json.dumps(resp), qos=1)
+            elif msg.topic == MQTT_TELEMETRY_TOPIC:
+                # User requests telemetry
+                resp = self.handle_telemetry(payload)
+                client.publish(MQTT_TELEMETRY_RESULT_TOPIC, json.dumps(resp), qos=1)
         except Exception as e:
-            response = {
-                "status": "failure",
-                "error": str(e)
-            }
-            logger.error(f"Error handling command: {e}")
+            traceback.print_exc()
 
-        self.mqtt_client.publish(
-            MQTT_RESPONSE_TOPIC,
-            json.dumps(response),
-            qos=MQTT_QOS
-        )
-
-    async def send_device_command(self, command_obj):
-        # HTTP POST to device with command payload
-        url = f"http://{self.device_address}/api/v1/command"
+    def handle_command(self, payload):
+        if not self.device_connected or not self.device_address:
+            return {"status": "error", "reason": "Device not connected"}
         try:
-            async with self.aiohttp_session.post(
-                url, json=command_obj, timeout=5
-            ) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    logger.error(f"Device command failed: HTTP {resp.status}")
-                    return None
+            data = json.loads(payload)
+        except Exception:
+            return {"status": "error", "reason": "Invalid JSON"}
+        # From instruction config, find settings if needed
+        settings = self.instruction_config.get('api2', {}).get('protocolPropertyList', {})
+        # For this device, simply forward the JSON as HTTP POST
+        try:
+            url = f"{self.device_address.rstrip('/')}/commands/control"
+            r = requests.post(url, json=data, timeout=5, headers={"Content-Type": "application/json"})
+            return {"status": "ok", "resp": r.json() if r.headers.get("Content-Type","").startswith("application/json") else r.text}
         except Exception as e:
-            logger.error(f"Error sending device command: {e}")
-            return None
+            return {"status": "error", "reason": str(e)}
+
+    def handle_telemetry(self, payload):
+        if not self.device_connected or not self.device_address:
+            return {"status": "error", "reason": "Device not connected"}
+        # Instructed via instruction config for telemetry
+        settings = self.instruction_config.get('api1', {}).get('protocolPropertyList', {})
+        # For this device, simply GET /telemetry/state
+        try:
+            url = f"{self.device_address.rstrip('/')}/telemetry/state"
+            r = requests.get(url, timeout=5)
+            return {"status": "ok", "resp": r.json() if r.headers.get("Content-Type","").startswith("application/json") else r.text}
+        except Exception as e:
+            return {"status": "error", "reason": str(e)}
 
 if __name__ == "__main__":
-    shifu = DeviceShifuLite3()
-    shifu.start()
+    try:
+        shifu = DeviceShifuLite3()
+        shifu.start()
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception as e:
+        traceback.print_exc()
+        sys.exit(1)
