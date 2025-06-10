@@ -1,300 +1,202 @@
 import os
 import sys
-import asyncio
+import time
+import threading
 import yaml
 import json
-import struct
-import socket
-from typing import Any, Dict, List, Optional
-from fastapi import FastAPI, Request, Response, HTTPException, status
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
-from kubernetes import client, config, watch
-from kubernetes.client.rest import ApiException
+from flask import Flask, request, jsonify
+import paho.mqtt.client as mqtt
+from kubernetes import client as k8s_client, config as k8s_config
 
-# DeviceShifu HTTP server for Deep Robotics control unit
+# Environment variables required
+EDGEDEVICE_NAME = os.environ.get("EDGEDEVICE_NAME")
+EDGEDEVICE_NAMESPACE = os.environ.get("EDGEDEVICE_NAMESPACE")
+MQTT_BROKER_ADDRESS = os.environ.get("MQTT_BROKER_ADDRESS")
+HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
+HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
+INSTRUCTION_PATH = "/etc/edgedevice/config/instructions"
 
-# ---------------------------
-# Environment & Configuration
-# ---------------------------
-
-EDGEDEVICE_NAME = os.environ.get('EDGEDEVICE_NAME')
-EDGEDEVICE_NAMESPACE = os.environ.get('EDGEDEVICE_NAMESPACE')
-DEVICE_HTTP_HOST = os.environ.get('DEVICE_HTTP_HOST', '0.0.0.0')
-DEVICE_HTTP_PORT = int(os.environ.get('DEVICE_HTTP_PORT', '8080'))
-DEVICE_UDP_IP = os.environ.get('DEVICE_UDP_IP')
-DEVICE_UDP_PORT = int(os.environ.get('DEVICE_UDP_PORT', '8899'))
-K8S_IN_CLUSTER = os.environ.get('KUBERNETES_SERVICE_HOST') is not None
-
-CONFIGMAP_DIR = '/etc/edgedevice/config/instructions'
-
-if not EDGEDEVICE_NAME or not EDGEDEVICE_NAMESPACE:
-    print("EDGEDEVICE_NAME and EDGEDEVICE_NAMESPACE env vars must be set", file=sys.stderr)
-    sys.exit(1)
-if not DEVICE_UDP_IP or not DEVICE_UDP_PORT:
-    print("DEVICE_UDP_IP and DEVICE_UDP_PORT env vars must be set", file=sys.stderr)
+if not EDGEDEVICE_NAME or not EDGEDEVICE_NAMESPACE or not MQTT_BROKER_ADDRESS:
+    print("Missing required environment variables.", file=sys.stderr)
     sys.exit(1)
 
-# ---------------------------
-# ConfigMap Loader
-# ---------------------------
-
-def load_api_config() -> Dict[str, Any]:
-    config_path = os.path.join(CONFIGMAP_DIR, 'instruction.yaml')
-    if not os.path.exists(config_path):
-        return {}
-    with open(config_path, 'r') as f:
-        return yaml.safe_load(f) or {}
-
-api_protocol_settings = load_api_config()
-
-# ---------------------------
-# Kubernetes CRD Integration
-# ---------------------------
-
-class EdgeDeviceStatus:
-    def __init__(self):
-        if K8S_IN_CLUSTER:
-            config.load_incluster_config()
-        else:
-            config.load_kube_config()
-        self.api = client.CustomObjectsApi()
-
-    def update_phase(self, phase: str):
-        body = {"status": {"edgeDevicePhase": phase}}
-        try:
-            self.api.patch_namespaced_custom_object_status(
-                group="shifu.edgenesis.io",
-                version="v1alpha1",
-                namespace=EDGEDEVICE_NAMESPACE,
-                plural="edgedevices",
-                name=EDGEDEVICE_NAME,
-                body=body
-            )
-        except ApiException as e:
-            print(f"Failed to update EdgeDevice status: {e}", file=sys.stderr)
-
-    def get_device_address(self) -> Optional[str]:
-        try:
-            obj = self.api.get_namespaced_custom_object(
-                group="shifu.edgenesis.io",
-                version="v1alpha1",
-                namespace=EDGEDEVICE_NAMESPACE,
-                plural="edgedevices",
-                name=EDGEDEVICE_NAME
-            )
-            return obj.get('spec', {}).get('address')
-        except ApiException as e:
-            print(f"Failed to get EdgeDevice CRD: {e}", file=sys.stderr)
-            return None
-
-edge_dev_status = EdgeDeviceStatus()
-
-# ---------------------------
-# UDP Protocol Definitions
-# ---------------------------
-
-class UDPClient:
-    def __init__(self, ip: str, port: int, recv_timeout: float = 1.0):
-        self.ip = ip
-        self.port = port
-        self.recv_timeout = recv_timeout
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(recv_timeout)
-
-    def send(self, data: bytes) -> None:
-        self.sock.sendto(data, (self.ip, self.port))
-
-    def receive(self, bufsize=4096) -> Optional[bytes]:
-        try:
-            data, _ = self.sock.recvfrom(bufsize)
-            return data
-        except socket.timeout:
-            return None
-
-    def close(self):
-        self.sock.close()
-
-# ---------------------------
-# Device Protocol
-# ---------------------------
-
-# Placeholder protocol mapping (should be replaced with actual protocol definition)
-# For demonstration, use simple message patterns
-
-def build_heartbeat_packet() -> bytes:
-    # Device-specific: replace with actual heartbeat packet structure
-    # Example: header + command code = 0x01 for heartbeat
-    return struct.pack('<BB', 0xAA, 0x01)
-
-def build_state_packet() -> bytes:
-    # Device-specific: replace with actual packet structure
-    return struct.pack('<BB', 0xAA, 0x02)
-
-def build_command_packet(cmd_name: str, params: Dict[str, Any]) -> bytes:
-    # Device-specific: must be replaced with actual protocol
-    # For example, map known commands to command codes and parameters
-    cmd_map = {
-        'heartbeat': 0x01,
-        'stand': 0x03,
-        'squat': 0x04,
-        'soft_stop': 0x05,
-        'zeroing': 0x06,
-        # ... add more mappings as per device spec
-    }
-    code = cmd_map.get(cmd_name, 0x00)
-    # For demonstration, pack code and one integer param if present
-    param_val = params.get('value', 0)
-    return struct.pack('<BBi', 0xAA, code, param_val)
-
-def parse_state_response(data: bytes) -> Dict[str, Any]:
-    # Device-specific: parse binary struct into JSON
-    # Example: suppose state packet is AA 02 followed by 4 floats (battery, rpy[3])
-    if len(data) < 18:
-        return {"error": "Incomplete state packet"}
-    hdr, cmd = struct.unpack('<BB', data[:2])
-    if hdr != 0xAA or cmd != 0x02:
-        return {"error": "Invalid state response"}
-    # Example: battery(float32), rpy(float32*3)
-    battery, rpy1, rpy2, rpy3 = struct.unpack('<ffff', data[2:18])
-    return {
-        "battery": battery,
-        "rpy": [rpy1, rpy2, rpy3],
-        # ... add more fields as per device spec
-    }
-
-def parse_heartbeat_response(data: bytes) -> Dict[str, Any]:
-    # Device-specific: parse binary heartbeat response
-    if len(data) < 3:
-        return {"error": "Incomplete heartbeat"}
-    hdr, cmd, status = struct.unpack('<BBB', data[:3])
-    return {"heartbeat": bool(status)}
-
-# ---------------------------
-# FastAPI App
-# ---------------------------
-
-app = FastAPI()
-
-# Maintain device status
-device_phase = "Pending"
-
-async def check_device_connectivity():
-    global device_phase
-    udp = UDPClient(DEVICE_UDP_IP, DEVICE_UDP_PORT)
+# Load API instructions from YAML
+def load_api_instructions():
     try:
-        udp.send(build_heartbeat_packet())
-        resp = udp.receive()
-        if resp is None:
-            device_phase = "Failed"
-        else:
-            device_phase = "Running"
+        with open(INSTRUCTION_PATH, "r") as f:
+            return yaml.safe_load(f)
     except Exception:
-        device_phase = "Failed"
-    finally:
-        udp.close()
-    edge_dev_status.update_phase(device_phase)
+        return {}
 
-@app.on_event("startup")
-async def startup_event():
-    # On startup, check device connectivity
-    await check_device_connectivity()
+api_instructions = load_api_instructions()
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    edge_dev_status.update_phase("Unknown")
-
-@app.middleware("http")
-async def update_status_middleware(request: Request, call_next):
-    # Update device phase before each request
-    await check_device_connectivity()
-    response = await call_next(request)
-    return response
-
-@app.get("/heartbeat")
-async def get_heartbeat():
-    udp = UDPClient(DEVICE_UDP_IP, DEVICE_UDP_PORT)
+# Kubernetes CRD client setup
+def k8s_init():
     try:
-        udp.send(build_heartbeat_packet())
-        data = udp.receive()
-        if data:
-            result = parse_heartbeat_response(data)
-            return JSONResponse(content=result)
-        else:
-            raise HTTPException(status_code=504, detail="No heartbeat from device")
-    finally:
-        udp.close()
+        k8s_config.load_incluster_config()
+    except Exception:
+        print("K8s in-cluster config load failed.", file=sys.stderr)
+        sys.exit(1)
 
-@app.get("/state")
-async def get_state(fields: Optional[str] = None):
-    udp = UDPClient(DEVICE_UDP_IP, DEVICE_UDP_PORT)
+k8s_init()
+crd_api = k8s_client.CustomObjectsApi()
+
+EDGEDEVICE_CRD_GROUP = "shifu.edgenesis.io"
+EDGEDEVICE_CRD_VERSION = "v1alpha1"
+EDGEDEVICE_CRD_PLURAL = "edgedevices"
+
+def get_edgedevice():
+    return crd_api.get_namespaced_custom_object(
+        EDGEDEVICE_CRD_GROUP,
+        EDGEDEVICE_CRD_VERSION,
+        EDGEDEVICE_NAMESPACE,
+        EDGEDEVICE_CRD_PLURAL,
+        EDGEDEVICE_NAME,
+    )
+
+def update_edgedevice_phase(phase):
+    for _ in range(3):
+        try:
+            body = {"status": {"edgeDevicePhase": phase}}
+            crd_api.patch_namespaced_custom_object_status(
+                EDGEDEVICE_CRD_GROUP,
+                EDGEDEVICE_CRD_VERSION,
+                EDGEDEVICE_NAMESPACE,
+                EDGEDEVICE_CRD_PLURAL,
+                EDGEDEVICE_NAME,
+                body,
+            )
+            return
+        except Exception:
+            time.sleep(1)
+
+# Get device address from EdgeDevice CRD
+def get_device_address():
     try:
-        udp.send(build_state_packet())
-        data = udp.receive()
-        if data:
-            result = parse_state_response(data)
-            if fields:
-                field_list = [f.strip() for f in fields.split(',')]
-                result = {k: v for k, v in result.items() if k in field_list}
-            return JSONResponse(content=result)
-        else:
-            raise HTTPException(status_code=504, detail="No state response from device")
-    finally:
-        udp.close()
+        ed = get_edgedevice()
+        return ed.get("spec", {}).get("address", None)
+    except Exception:
+        return None
 
-@app.get("/telemetry")
-async def get_telemetry(fields: Optional[str] = None, page: Optional[int] = None, limit: Optional[int] = None):
-    # For simplicity, telemetry = state
-    udp = UDPClient(DEVICE_UDP_IP, DEVICE_UDP_PORT)
+# MQTT Setup and Callbacks
+mqtt_client = mqtt.Client()
+mqtt_connected = threading.Event()
+mqtt_failed = threading.Event()
+telemetry_data = []
+telemetry_lock = threading.Lock()
+
+def on_connect(client, userdata, flags, rc):
+    if rc == 0:
+        mqtt_connected.set()
+        mqtt_failed.clear()
+        update_edgedevice_phase("Running")
+        # Subscribe to telemetry topic
+        client.subscribe("device/telemetry", qos=1)
+    else:
+        mqtt_failed.set()
+        mqtt_connected.clear()
+        update_edgedevice_phase("Failed")
+
+def on_disconnect(client, userdata, rc):
+    mqtt_connected.clear()
+    if rc != 0:
+        update_edgedevice_phase("Failed")
+    else:
+        update_edgedevice_phase("Pending")
+
+def on_message(client, userdata, msg):
+    if msg.topic == "device/telemetry":
+        try:
+            payload = msg.payload.decode("utf-8")
+            data = json.loads(payload)
+            with telemetry_lock:
+                telemetry_data.append(data)
+                if len(telemetry_data) > 100:
+                    telemetry_data.pop(0)
+        except Exception:
+            pass
+
+mqtt_client.on_connect = on_connect
+mqtt_client.on_disconnect = on_disconnect
+mqtt_client.on_message = on_message
+
+def mqtt_connect_loop():
+    broker_host, broker_port = MQTT_BROKER_ADDRESS.split(":")
+    broker_port = int(broker_port)
+    while True:
+        try:
+            device_address = get_device_address()
+            if not device_address:
+                update_edgedevice_phase("Unknown")
+                time.sleep(5)
+                continue
+            mqtt_client.connect(broker_host, broker_port, keepalive=60)
+            mqtt_client.loop_forever()
+        except Exception:
+            update_edgedevice_phase("Failed")
+            time.sleep(5)
+
+mqtt_thread = threading.Thread(target=mqtt_connect_loop, daemon=True)
+mqtt_thread.start()
+
+# Flask HTTP API
+app = Flask(__name__)
+
+def get_protocol_settings(api_name):
+    return api_instructions.get(api_name, {}).get("protocolPropertyList", {})
+
+@app.route("/api/motion", methods=["POST"])
+def api_motion():
+    # Publish motion control command to MQTT
+    payload = request.get_json(force=True)
+    settings = get_protocol_settings("api1")  # As per instructions YAML
+    qos = int(settings.get("qos", 1))
     try:
-        udp.send(build_state_packet())
-        data = udp.receive()
-        if data:
-            result = parse_state_response(data)
-            if fields:
-                field_list = [f.strip() for f in fields.split(',')]
-                result = {k: v for k, v in result.items() if k in field_list}
-            # Pagination is not supported in this simple example
-            return JSONResponse(content=result)
-        else:
-            raise HTTPException(status_code=504, detail="No telemetry from device")
-    finally:
-        udp.close()
+        mqtt_client.publish("device/commands/motion", json.dumps(payload), qos=qos)
+        return jsonify({"status": "sent", "topic": "device/commands/motion"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-class CommandRequest(BaseModel):
-    command: str
-    parameters: Optional[Dict[str, Any]] = {}
-
-@app.post("/cmd")
-async def post_cmd(cmd: CommandRequest):
-    udp = UDPClient(DEVICE_UDP_IP, DEVICE_UDP_PORT)
+@app.route("/api/heartbeat", methods=["POST"])
+def api_heartbeat():
+    # Publish heartbeat command to MQTT
+    payload = request.get_json(force=True)
+    settings = get_protocol_settings("api2")
+    qos = int(settings.get("qos", 1))
     try:
-        udp.send(build_command_packet(cmd.command, cmd.parameters or {}))
-        data = udp.receive()
-        if data:
-            return JSONResponse(content={"success": True, "response": list(data)})
-        else:
-            raise HTTPException(status_code=504, detail="No response from device")
-    finally:
-        udp.close()
+        mqtt_client.publish("device/commands/heartbeat", json.dumps(payload), qos=qos)
+        return jsonify({"status": "sent", "topic": "device/commands/heartbeat"}), 200
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@app.post("/commands")
-async def post_commands(cmd: CommandRequest):
-    udp = UDPClient(DEVICE_UDP_IP, DEVICE_UDP_PORT)
-    try:
-        udp.send(build_command_packet(cmd.command, cmd.parameters or {}))
-        data = udp.receive()
-        if data:
-            return JSONResponse(content={"success": True, "response": list(data)})
-        else:
-            raise HTTPException(status_code=504, detail="No response from device")
-    finally:
-        udp.close()
+@app.route("/api/telemetry", methods=["GET"])
+def api_telemetry():
+    # Return latest telemetry data received from device
+    with telemetry_lock:
+        data = telemetry_data[-1] if telemetry_data else {}
+    return jsonify(data), 200
 
-# ---------------------------
-# HTTP Run Entrypoint
-# ---------------------------
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"mqtt_connected": mqtt_connected.is_set()}), 200
+
+def phase_update_loop():
+    # Monitor the MQTT connection and update EdgeDevice phase as needed
+    last_phase = None
+    while True:
+        if mqtt_connected.is_set():
+            phase = "Running"
+        elif mqtt_failed.is_set():
+            phase = "Failed"
+        else:
+            phase = "Pending"
+        if phase != last_phase:
+            update_edgedevice_phase(phase)
+            last_phase = phase
+        time.sleep(3)
+
+phase_thread = threading.Thread(target=phase_update_loop, daemon=True)
+phase_thread.start()
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host=DEVICE_HTTP_HOST, port=DEVICE_HTTP_PORT)
+    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
