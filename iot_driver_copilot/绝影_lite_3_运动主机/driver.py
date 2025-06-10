@@ -1,236 +1,232 @@
 import os
-import socket
 import yaml
-import json
+import socket
 import struct
+import json
 import threading
-import logging
-from flask import Flask, request, jsonify
-from kubernetes import client, config, watch
+from typing import Dict, Any, Optional, List
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import JSONResponse
+from kubernetes import client, config
 from kubernetes.client.rest import ApiException
+from starlette.middleware.cors import CORSMiddleware
+from starlette.status import HTTP_503_SERVICE_UNAVAILABLE
 
-# Logging setup
-logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s:%(message)s')
+# --- CONFIG & ENV ---
 
-# Environment Variables
 EDGEDEVICE_NAME = os.environ['EDGEDEVICE_NAME']
 EDGEDEVICE_NAMESPACE = os.environ['EDGEDEVICE_NAMESPACE']
+UDP_DEVICE_IP = os.environ['DEVICE_UDP_IP']
+UDP_DEVICE_PORT = int(os.environ['DEVICE_UDP_PORT'])
 HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
 HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '8080'))
-UDP_DEVICE_IP = os.environ['UDP_DEVICE_IP']
-UDP_DEVICE_PORT = int(os.environ['UDP_DEVICE_PORT'])
 
-INSTRUCTION_CONFIG_PATH = '/etc/edgedevice/config/instructions'
+CONFIGMAP_CONFIG_DIR = '/etc/edgedevice/config/instructions'
+INSTRUCTION_CONFIG_FILE = os.path.join(CONFIGMAP_CONFIG_DIR, 'instructions.yaml')
 
-PHASE_PENDING = "Pending"
-PHASE_RUNNING = "Running"
-PHASE_FAILED = "Failed"
-PHASE_UNKNOWN = "Unknown"
+EDGEDEVICE_CRD_GROUP = "shifu.edgenesis.io"
+EDGEDEVICE_CRD_VERSION = "v1alpha1"
+EDGEDEVICE_CRD_PLURAL = "edgedevices"
 
-# CRD constants
-CRD_GROUP = "shifu.edgenesis.io"
-CRD_VERSION = "v1alpha1"
-CRD_PLURAL = "edgedevices"
+# --- LOAD INSTRUCTION CONFIGMAP ---
 
-# --- Kubernetes CRD Status Updater ---
-class CRDStatusUpdater(threading.Thread):
-    def __init__(self, device_name, namespace):
-        super().__init__(daemon=True)
-        config.load_incluster_config()
-        self.api = client.CustomObjectsApi()
-        self.device_name = device_name
-        self.namespace = namespace
-        self.last_phase = None
-        self._phase_lock = threading.Lock()
-        self._current_phase = PHASE_UNKNOWN
-
-    def set_phase(self, phase):
-        with self._phase_lock:
-            if phase != self._current_phase:
-                self._current_phase = phase
-
-    def run(self):
-        while True:
-            with self._phase_lock:
-                phase = self._current_phase
-            if phase != self.last_phase:
-                self._update_phase(phase)
-                self.last_phase = phase
-            threading.Event().wait(3)
-
-    def _update_phase(self, phase):
-        body = {"status": {"edgeDevicePhase": phase}}
-        try:
-            self.api.patch_namespaced_custom_object_status(
-                group=CRD_GROUP,
-                version=CRD_VERSION,
-                namespace=self.namespace,
-                plural=CRD_PLURAL,
-                name=self.device_name,
-                body=body
-            )
-            logging.info(f"EdgeDevice status updated: {phase}")
-        except ApiException as e:
-            logging.error(f"Failed to update EdgeDevice phase: {e}")
-
-# --- UDP Client ---
-class UdpDeviceClient:
-    def __init__(self, udp_ip, udp_port):
-        self.udp_ip = udp_ip
-        self.udp_port = udp_port
-        self.sock = None
-        self.lock = threading.Lock()
-
-    def connect(self):
-        with self.lock:
-            if self.sock is not None:
-                self.sock.close()
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.sock.settimeout(2.0)
-
-    def close(self):
-        with self.lock:
-            if self.sock:
-                self.sock.close()
-            self.sock = None
-
-    def send_recv(self, payload):
-        with self.lock:
-            if not self.sock:
-                self.connect()
-            try:
-                self.sock.sendto(payload, (self.udp_ip, self.udp_port))
-                data, _ = self.sock.recvfrom(4096)
-                return data
-            except Exception as e:
-                logging.warning(f"UDP communication error: {e}")
-                self.close()
-                raise e
-
-# --- Config Loader ---
-def load_instruction_config():
-    if not os.path.exists(INSTRUCTION_CONFIG_PATH):
+def load_instruction_config(path: str) -> Dict[str, Any]:
+    try:
+        with open(path, 'r') as f:
+            return yaml.safe_load(f) or {}
+    except Exception:
         return {}
-    with open(INSTRUCTION_CONFIG_PATH) as f:
-        return yaml.safe_load(f) or {}
 
-api_settings = load_instruction_config()
+instruction_config = load_instruction_config(INSTRUCTION_CONFIG_FILE)
 
-# --- DeviceShifu Logic ---
-class RobotDriver:
-    def __init__(self, udp_client):
-        self.udp = udp_client
+# --- KUBERNETES CLIENT SETUP ---
 
-    # Example: UDP protocol mapping functions (to be customized per actual binary protocol)
-    def build_state_query(self, fields=None):
-        # For demonstration, a simple protocol: "STATE?fields=rpy,battery"
-        if fields:
-            field_str = ','.join(fields)
-            msg = f'STATE?fields={field_str}'.encode('utf-8')
-        else:
-            msg = b'STATE'
-        return msg
+def k8s_client():
+    try:
+        config.load_incluster_config()
+    except Exception:
+        config.load_kube_config()
+    return client.CustomObjectsApi()
 
-    def parse_state_response(self, data):
-        # Real implementation: parse the binary struct to dict
-        # Here, we try to decode as UTF-8, fallback to hex
-        try:
-            text = data.decode('utf-8')
-            if text.startswith('{'):
-                return json.loads(text)
-            return {"raw": text}
-        except Exception:
-            return {"raw_hex": data.hex()}
+k8s_api = k8s_client()
 
-    def build_command(self, cmd_name, params):
-        # For demonstration, build as "CMD:heartbeat" or "CMD:stand:height=0.5"
-        param_str = ''
-        if params:
-            param_str = ':' + ','.join(f"{k}={v}" for k, v in params.items())
-        msg = f'CMD:{cmd_name}{param_str}'.encode('utf-8')
-        return msg
+def get_edgedevice():
+    return k8s_api.get_namespaced_custom_object(
+        group=EDGEDEVICE_CRD_GROUP,
+        version=EDGEDEVICE_CRD_VERSION,
+        namespace=EDGEDEVICE_NAMESPACE,
+        plural=EDGEDEVICE_CRD_PLURAL,
+        name=EDGEDEVICE_NAME
+    )
 
-    def parse_command_response(self, data):
-        # Real implementation: parse status/acknowledgement
-        try:
-            text = data.decode('utf-8')
-            return {"response": text}
-        except Exception:
-            return {"response_hex": data.hex()}
+def update_edgedevice_status(phase: str):
+    body = {
+        "status": {
+            "edgeDevicePhase": phase
+        }
+    }
+    try:
+        k8s_api.patch_namespaced_custom_object_status(
+            group=EDGEDEVICE_CRD_GROUP,
+            version=EDGEDEVICE_CRD_VERSION,
+            namespace=EDGEDEVICE_NAMESPACE,
+            plural=EDGEDEVICE_CRD_PLURAL,
+            name=EDGEDEVICE_NAME,
+            body=body
+        )
+    except ApiException:
+        pass
 
-# --- Flask HTTP Server ---
-app = Flask(__name__)
+# --- UDP COMMUNICATION WRAPPER ---
 
-udp_client = UdpDeviceClient(UDP_DEVICE_IP, UDP_DEVICE_PORT)
-robot_driver = RobotDriver(udp_client)
-status_updater = CRDStatusUpdater(EDGEDEVICE_NAME, EDGEDEVICE_NAMESPACE)
-status_updater.set_phase(PHASE_PENDING)
-status_updater.start()
+class UDPDeviceClient:
+    def __init__(self, device_ip: str, device_port: int):
+        self.device_ip = device_ip
+        self.device_port = device_port
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(2.0)
+        self.lock = threading.Lock()
+        self.last_status = 'Unknown'
 
-def maintain_device_status():
-    # Background thread to probe device and update status
-    def probe():
-        while True:
+    def _send_and_receive(self, payload: bytes) -> Optional[bytes]:
+        with self.lock:
             try:
-                # Send a heartbeat or state query
-                query = robot_driver.build_state_query(fields=["robot_basic_state"])
-                udp_client.connect()
-                udp_client.send_recv(query)
-                status_updater.set_phase(PHASE_RUNNING)
+                self.sock.sendto(payload, (self.device_ip, self.device_port))
+                data, _ = self.sock.recvfrom(4096)
+                self.last_status = 'Running'
+                return data
             except socket.timeout:
-                status_updater.set_phase(PHASE_PENDING)
+                self.last_status = 'Pending'
+                return None
             except Exception:
-                status_updater.set_phase(PHASE_FAILED)
-            threading.Event().wait(5)
-    t = threading.Thread(target=probe, daemon=True)
-    t.start()
+                self.last_status = 'Failed'
+                return None
 
-maintain_device_status()
+    def check_connection(self) -> str:
+        # Try a dummy "heartbeat" command for status check
+        payload = self.encode_command("heartbeat", {})
+        resp = self._send_and_receive(payload)
+        if resp:
+            self.last_status = 'Running'
+            return 'Running'
+        elif self.last_status == 'Failed':
+            return 'Failed'
+        elif self.last_status == 'Pending':
+            return 'Pending'
+        else:
+            return 'Unknown'
 
-@app.route('/state', methods=['GET'])
-def get_state():
-    fields = request.args.get('fields')
-    field_list = None
-    if fields:
-        field_list = [f.strip() for f in fields.split(',')]
+    def get_state(self, fields: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        payload = self.encode_command("get_state", {"fields": fields} if fields else {})
+        resp = self._send_and_receive(payload)
+        if resp:
+            return self.decode_state(resp, fields)
+        else:
+            return None
+
+    def send_command(self, command: str, params: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        payload = self.encode_command(command, params)
+        resp = self._send_and_receive(payload)
+        if resp:
+            return self.decode_command_response(resp)
+        else:
+            return None
+
+    # --- Device-specific protocol encoding/decoding (simplified for example) ---
+
+    def encode_command(self, cmd: str, params: Dict[str, Any]) -> bytes:
+        # Example: {"cmd": "stand", "params": {"speed": 1.2}} as JSON then bytes.
+        message = {"cmd": cmd, "params": params}
+        return json.dumps(message).encode('utf-8')
+
+    def decode_state(self, data: bytes, fields: Optional[List[str]]) -> Dict[str, Any]:
+        # Example: response as JSON over UDP, filter fields if specified
+        try:
+            state = json.loads(data.decode('utf-8'))
+            if fields:
+                state = {k: v for k, v in state.items() if k in fields}
+            return state
+        except Exception:
+            return {"error": "Failed to decode device state"}
+
+    def decode_command_response(self, data: bytes) -> Dict[str, Any]:
+        try:
+            return json.loads(data.decode('utf-8'))
+        except Exception:
+            return {"status": "error", "detail": "Failed to decode response"}
+
+# --- K8S PHASE MAINTAINER THREAD ---
+
+def phase_maintainer(client: UDPDeviceClient):
+    prev_phase = None
+    while True:
+        phase = client.check_connection()
+        if phase != prev_phase:
+            update_edgedevice_status(phase)
+            prev_phase = phase
+        threading.Event().wait(5)
+
+# --- FASTAPI APP ---
+
+app = FastAPI(title="Deep Robotics Lite3 Robot Control DeviceShifu")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+udp_client = UDPDeviceClient(UDP_DEVICE_IP, UDP_DEVICE_PORT)
+
+# --- PHASE MAINTAINER THREAD ---
+threading.Thread(target=phase_maintainer, args=(udp_client,), daemon=True).start()
+
+# --- API: GET /state ---
+
+@app.get("/state")
+def get_state(request: Request):
+    fields_q = request.query_params.get("fields")
+    fields = [f.strip() for f in fields_q.split(",")] if fields_q else None
+
+    # Get settings from instruction_config if present
+    protocol_settings = instruction_config.get("api1", {}).get("protocolPropertyList", {}) if "api1" in instruction_config else {}
+
+    state = udp_client.get_state(fields)
+    if state is None:
+        raise HTTPException(status_code=HTTP_503_SERVICE_UNAVAILABLE, detail="Failed to retrieve state from device")
+    return JSONResponse(content=state)
+
+# --- API: POST /cmd ---
+
+@app.post("/cmd")
+async def post_cmd(request: Request):
     try:
-        query = robot_driver.build_state_query(field_list)
-        data = udp_client.send_recv(query)
-        state = robot_driver.parse_state_response(data)
-        if field_list:
-            # Filter fields if possible
-            filtered = {k: v for k, v in state.items() if k in field_list}
-            return jsonify(filtered)
-        return jsonify(state)
-    except socket.timeout:
-        status_updater.set_phase(PHASE_PENDING)
-        return jsonify({"error": "Device timeout"}), 504
-    except Exception as e:
-        status_updater.set_phase(PHASE_FAILED)
-        return jsonify({"error": str(e)}), 500
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+    command = body.get("command")
+    params = body.get("params", {})
 
-@app.route('/cmd', methods=['POST'])
-def post_cmd():
-    try:
-        payload = request.get_json(force=True)
-        cmd_name = payload.get('command')
-        params = payload.get('params', {})
-        if not cmd_name:
-            return jsonify({"error": "Missing 'command' in JSON"}), 400
-        cmd = robot_driver.build_command(cmd_name, params)
-        data = udp_client.send_recv(cmd)
-        resp = robot_driver.parse_command_response(data)
-        return jsonify(resp)
-    except socket.timeout:
-        status_updater.set_phase(PHASE_PENDING)
-        return jsonify({"error": "Device timeout"}), 504
-    except Exception as e:
-        status_updater.set_phase(PHASE_FAILED)
-        return jsonify({"error": str(e)}), 500
+    if not command:
+        raise HTTPException(status_code=400, detail="Missing 'command' in request body")
 
-@app.route('/healthz', methods=['GET'])
+    # Get settings from instruction_config if present
+    protocol_settings = instruction_config.get("api2", {}).get("protocolPropertyList", {}) if "api2" in instruction_config else {}
+
+    resp = udp_client.send_command(command, params)
+    if resp is None:
+        raise HTTPException(status_code=HTTP_503_SERVICE_UNAVAILABLE, detail="Failed to send command to device")
+    return JSONResponse(content=resp)
+
+# --- HEALTH CHECK ---
+
+@app.get("/healthz")
 def healthz():
-    return "ok"
+    return {"status": "ok"}
 
-if __name__ == '__main__':
-    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
+# --- MAIN (if standalone, for local testing) ---
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
